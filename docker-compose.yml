@@ -1,0 +1,16 @@
+services:
+  ytm-server:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      REGISTRATION_KEY: "change-me"   # required header X-Registration-Key to create users
+      CACHE_THRESHOLD: "3"
+      MAX_CACHE_GB: "20"
+      MAX_CACHE_TRACKS: "5000"
+      OPUS_BITRATE: "96k"
+      LOG_LEVEL: "info"
+    volumes:
+      - ./data:/data
+      - ./cache:/cache
