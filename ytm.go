@@ -12,24 +12,46 @@ import (
 	"time"
 )
 
-// Minimal YouTube Music (InnerTube) client using the user's browser cookie,
-// the same approach ytmusicapi uses. This is unofficial and may break when
-// YouTube changes its responses.
+// Mode selects which InnerTube client/site is used. Both share one backend and
+// one set of cookies; they differ only in client identity and response layout.
+type Mode string
 
 const (
-	ytmOrigin = "https://music.youtube.com"
-	ytmAPI    = ytmOrigin + "/youtubei/v1/"
-	ytmUA     = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
-	// ytmusicapi's "songs" search filter.
-	songsFilter = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
+	ModeMusic   Mode = "music"
+	ModeYouTube Mode = "youtube"
 )
 
+const (
+	ytmUA        = "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"
+	songsFilter  = "EgWKAQIIAWoMEA4QChADEAQQCRAF"
+	videosFilter = "EgIQAQ%3D%3D"
+	// Public key embedded in YouTube's own web client (not a secret).
+	ytWebKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
+)
+
+func parseMode(s string) Mode {
+	if s == string(ModeYouTube) {
+		return ModeYouTube
+	}
+	return ModeMusic
+}
+
+type site struct{ origin, client, version, clientID string }
+
+func (m Mode) site() site {
+	if m == ModeYouTube {
+		return site{"https://www.youtube.com", "WEB", "2.20250101.00.00", "1"}
+	}
+	return site{"https://music.youtube.com", "WEB_REMIX", "1.20250101.01.00", "67"}
+}
+
 type Item struct {
-	Type     string `json:"type"` // song | album | artist | playlist
+	Type     string `json:"type"` // song | album | artist | playlist | mix
 	ID       string `json:"id"`
 	Title    string `json:"title"`
 	Subtitle string `json:"subtitle,omitempty"`
 	Thumb    string `json:"thumbnail,omitempty"`
+	Duration int    `json:"duration,omitempty"` // seconds, 0 = unknown
 }
 
 type Section struct {
@@ -58,38 +80,45 @@ func sapisid(cookie string) string {
 	return cookieValue(cookie, "SAPISID")
 }
 
-func authHeader(cookie string) (string, error) {
+func authHeader(cookie, origin string) (string, error) {
 	sid := sapisid(cookie)
 	if sid == "" {
 		return "", fmt.Errorf("cookie has no SAPISID / __Secure-3PAPISID")
 	}
 	ts := time.Now().Unix()
-	sum := sha1.Sum([]byte(fmt.Sprintf("%d %s %s", ts, sid, ytmOrigin)))
+	sum := sha1.Sum([]byte(fmt.Sprintf("%d %s %s", ts, sid, origin)))
 	return fmt.Sprintf("SAPISIDHASH %d_%x", ts, sum), nil
 }
 
-func (y *YTM) call(ctx context.Context, cookie, endpoint string, extra map[string]any) (map[string]any, error) {
+func (y *YTM) call(ctx context.Context, mode Mode, cookie, endpoint string, extra map[string]any) (map[string]any, error) {
+	st := mode.site()
 	body := map[string]any{
 		"context": map[string]any{"client": map[string]any{
-			"clientName": "WEB_REMIX", "clientVersion": "1.20250101.01.00", "hl": "en", "gl": "US",
+			"clientName": st.client, "clientVersion": st.version, "hl": "en", "gl": "US",
 		}},
 	}
 	for k, v := range extra {
 		body[k] = v
 	}
 	buf, _ := json.Marshal(body)
-	auth, err := authHeader(cookie)
+	auth, err := authHeader(cookie, st.origin)
 	if err != nil {
 		return nil, err
 	}
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, ytmAPI+endpoint+"?prettyPrint=false", bytes.NewReader(buf))
+	url := st.origin + "/youtubei/v1/" + endpoint + "?prettyPrint=false"
+	if mode == ModeYouTube {
+		url += "&key=" + ytWebKey
+	}
+	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(buf))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", ytmUA)
 	req.Header.Set("Cookie", cookie)
 	req.Header.Set("Authorization", auth)
-	req.Header.Set("Origin", ytmOrigin)
-	req.Header.Set("X-Origin", ytmOrigin)
+	req.Header.Set("Origin", st.origin)
+	req.Header.Set("X-Origin", st.origin)
 	req.Header.Set("X-Goog-AuthUser", "0")
+	req.Header.Set("X-YouTube-Client-Name", st.clientID)
+	req.Header.Set("X-YouTube-Client-Version", st.version)
 	resp, err := y.http.Do(req)
 	if err != nil {
 		return nil, err
@@ -97,7 +126,7 @@ func (y *YTM) call(ctx context.Context, cookie, endpoint string, extra map[strin
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, 300))
-		return nil, fmt.Errorf("youtube music returned %d: %s", resp.StatusCode, snippet)
+		return nil, fmt.Errorf("youtube returned %d: %s", resp.StatusCode, snippet)
 	}
 	var out map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
@@ -106,43 +135,116 @@ func (y *YTM) call(ctx context.Context, cookie, endpoint string, extra map[strin
 	return out, nil
 }
 
-func (y *YTM) Home(ctx context.Context, cookie string) ([]Section, error) {
-	return y.browse(ctx, cookie, "FEmusic_home")
+func (y *YTM) parse(mode Mode, res map[string]any, videoTitle string, mixesFirst bool) []Section {
+	if mode == ModeYouTube {
+		var c ytCollected
+		walkYT(res, &c)
+		return c.sections(videoTitle, mixesFirst)
+	}
+	var out []Section
+	collectSections(res, &out)
+	return out
 }
 
-func (y *YTM) LibraryPlaylists(ctx context.Context, cookie string) ([]Section, error) {
-	return y.browse(ctx, cookie, "FEmusic_liked_playlists")
+func (y *YTM) browse(ctx context.Context, mode Mode, cookie, browseID, videoTitle string, mixesFirst bool) ([]Section, error) {
+	res, err := y.call(ctx, mode, cookie, "browse", map[string]any{"browseId": browseID})
+	if err != nil {
+		return nil, err
+	}
+	return y.parse(mode, res, videoTitle, mixesFirst), nil
 }
 
-func (y *YTM) Playlist(ctx context.Context, cookie, id string) ([]Section, error) {
+func (y *YTM) Home(ctx context.Context, mode Mode, cookie string) ([]Section, error) {
+	if mode == ModeYouTube {
+		return y.browse(ctx, mode, cookie, "FEwhat_to_watch", "Recommended", true)
+	}
+	return y.browse(ctx, mode, cookie, "FEmusic_home", "", false)
+}
+
+func (y *YTM) LibraryPlaylists(ctx context.Context, mode Mode, cookie string) ([]Section, error) {
+	if mode == ModeYouTube {
+		return y.browse(ctx, mode, cookie, "FEplaylist_aggregation", "Videos", false)
+	}
+	return y.browse(ctx, mode, cookie, "FEmusic_liked_playlists", "", false)
+}
+
+// Playlist opens a playlist/album/channel. Mixes (RD...) are "radio" playlists
+// and only exist through the `next` endpoint, so they are routed to Queue.
+func (y *YTM) Playlist(ctx context.Context, mode Mode, cookie, id string) ([]Section, error) {
+	if isRadioID(id) {
+		return y.Queue(ctx, mode, cookie, "", id)
+	}
 	if !strings.HasPrefix(id, "VL") && !strings.HasPrefix(id, "MPRE") && !strings.HasPrefix(id, "UC") {
 		id = "VL" + id
 	}
-	return y.browse(ctx, cookie, id)
+	return y.browse(ctx, mode, cookie, id, "Tracks", false)
 }
 
-func (y *YTM) browse(ctx context.Context, cookie, browseID string) ([]Section, error) {
-	res, err := y.call(ctx, cookie, "browse", map[string]any{"browseId": browseID})
-	if err != nil {
-		return nil, err
-	}
-	var out []Section
-	collectSections(res, &out)
-	return out, nil
-}
-
-func (y *YTM) Search(ctx context.Context, cookie, q string, songsOnly bool) ([]Section, error) {
+func (y *YTM) Search(ctx context.Context, mode Mode, cookie, q string, onlyPrimary bool) ([]Section, error) {
 	extra := map[string]any{"query": q}
-	if songsOnly {
-		extra["params"] = songsFilter
+	if onlyPrimary {
+		if mode == ModeYouTube {
+			extra["params"] = videosFilter
+		} else {
+			extra["params"] = songsFilter
+		}
 	}
-	res, err := y.call(ctx, cookie, "search", extra)
+	res, err := y.call(ctx, mode, cookie, "search", extra)
 	if err != nil {
 		return nil, err
 	}
-	var out []Section
-	collectSections(res, &out)
-	return out, nil
+	return y.parse(mode, res, "Videos", false), nil
+}
+
+// Queue returns the "up next" list for a video (auto-mix/radio) or for a
+// playlist/mix id. Same shape in both modes.
+func (y *YTM) Queue(ctx context.Context, mode Mode, cookie, videoID, playlistID string) ([]Section, error) {
+	extra := map[string]any{}
+	if videoID != "" {
+		extra["videoId"] = videoID
+	}
+	switch {
+	case playlistID != "":
+		extra["playlistId"] = playlistID
+	case mode == ModeYouTube:
+		extra["playlistId"] = "RD" + videoID
+	default:
+		extra["playlistId"] = "RDAMVM" + videoID
+		extra["params"] = "wAEB"
+	}
+	if mode == ModeMusic {
+		extra["enablePersistentPlaylistPanel"] = true
+		extra["isAudioOnly"] = true
+		extra["tunerSettingValue"] = "AUTOMIX_SETTING_NORMAL"
+	}
+	res, err := y.call(ctx, mode, cookie, "next", extra)
+	if err != nil {
+		return nil, err
+	}
+	var items []Item
+	collectPanel(res, &items)
+	items = dedupe(items)
+	if len(items) == 0 {
+		return nil, nil
+	}
+	return []Section{{Title: "Up next", Items: items}}, nil
+}
+
+// CreatePlaylist creates a real playlist on the user's YouTube account.
+func (y *YTM) CreatePlaylist(ctx context.Context, mode Mode, cookie, title, privacy string, ids []string) (string, error) {
+	body := map[string]any{"title": title, "description": "", "privacyStatus": privacy}
+	if len(ids) > 0 {
+		body["videoIds"] = ids
+	}
+	res, err := y.call(ctx, mode, cookie, "playlist/create", body)
+	if err != nil {
+		return "", err
+	}
+	id := str(res["playlistId"])
+	if id == "" {
+		return "", fmt.Errorf("youtube did not return a playlist id")
+	}
+	return id, nil
 }
 
 // ---- response parsing helpers ----
@@ -220,7 +322,7 @@ func parseResponsive(m map[string]any) *Item {
 	col := func(i int) string {
 		return runsText(dig(m, "flexColumns", i, "musicResponsiveListItemFlexColumnRenderer", "text"))
 	}
-	it := &Item{Title: col(0), Subtitle: col(1), Thumb: findThumb(m["thumbnail"])}
+	it := &Item{Title: col(0), Subtitle: col(1), Thumb: findThumb(m["thumbnail"]), Duration: responsiveDuration(m)}
 	if vid != "" {
 		it.Type, it.ID = "song", vid
 		return it

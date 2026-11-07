@@ -137,7 +137,7 @@ func (s *Server) ytmHandler(f func(r *http.Request, u User) ([]Section, error)) 
 }
 
 func (s *Server) handleHome(r *http.Request, u User) ([]Section, error) {
-	return s.ytm.Home(r.Context(), u.Cookie)
+	return s.ytm.Home(r.Context(), modeOf(r), u.Cookie)
 }
 
 func (s *Server) handleSearch(r *http.Request, u User) ([]Section, error) {
@@ -145,11 +145,11 @@ func (s *Server) handleSearch(r *http.Request, u User) ([]Section, error) {
 	if q == "" {
 		return nil, nil
 	}
-	return s.ytm.Search(r.Context(), u.Cookie, q, r.URL.Query().Get("filter") == "songs")
+	return s.ytm.Search(r.Context(), modeOf(r), u.Cookie, q, r.URL.Query().Get("filter") != "")
 }
 
 func (s *Server) handleLibrary(r *http.Request, u User) ([]Section, error) {
-	return s.ytm.LibraryPlaylists(r.Context(), u.Cookie)
+	return s.ytm.LibraryPlaylists(r.Context(), modeOf(r), u.Cookie)
 }
 
 func (s *Server) handleYTPlaylist(r *http.Request, u User) ([]Section, error) {
@@ -157,7 +157,7 @@ func (s *Server) handleYTPlaylist(r *http.Request, u User) ([]Section, error) {
 	if !browseIDRe.MatchString(id) {
 		return nil, context.Canceled
 	}
-	return s.ytm.Playlist(r.Context(), u.Cookie, id)
+	return s.ytm.Playlist(r.Context(), modeOf(r), u.Cookie, id)
 }
 
 // ---- local playlists ----
@@ -192,7 +192,10 @@ func (s *Server) listPlaylists(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) createPlaylist(w http.ResponseWriter, r *http.Request) {
-	var in struct{ Name string }
+	var in struct {
+		Name   string    `json:"name"`
+		Tracks []trackIn `json:"tracks"`
+	}
 	if !readJSON(w, r, &in) {
 		return
 	}
@@ -201,14 +204,40 @@ func (s *Server) createPlaylist(w http.ResponseWriter, r *http.Request) {
 		jsonErr(w, 400, "name required (max 100 chars)")
 		return
 	}
-	res, err := s.db.Exec(`INSERT INTO playlists(user_id,name,created_at) VALUES(?,?,?)`,
+	if len(in.Tracks) > 1000 {
+		jsonErr(w, 400, "too many tracks (max 1000)")
+		return
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		jsonErr(w, 500, "db error")
+		return
+	}
+	defer tx.Rollback()
+	res, err := tx.Exec(`INSERT INTO playlists(user_id,name,created_at) VALUES(?,?,?)`,
 		userFrom(r).ID, in.Name, time.Now().Unix())
 	if err != nil {
 		jsonErr(w, 500, "db error")
 		return
 	}
 	id, _ := res.LastInsertId()
-	writeJSON(w, 201, map[string]any{"id": id, "name": in.Name})
+	pos := 0
+	for _, t := range in.Tracks {
+		if !videoIDRe.MatchString(t.VideoID) {
+			continue
+		}
+		if rr, err := tx.Exec(`INSERT OR IGNORE INTO playlist_tracks(playlist_id, position, video_id, title, artist) VALUES(?,?,?,?,?)`,
+			id, pos, t.VideoID, t.Title, t.Artist); err == nil {
+			if n, _ := rr.RowsAffected(); n > 0 {
+				pos++
+			}
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		jsonErr(w, 500, "db error")
+		return
+	}
+	writeJSON(w, 201, map[string]any{"id": id, "name": in.Name, "trackCount": pos})
 }
 
 func (s *Server) getPlaylist(w http.ResponseWriter, r *http.Request) {

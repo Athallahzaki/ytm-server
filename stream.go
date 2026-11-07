@@ -145,7 +145,7 @@ func (sw *softWriter) Write(p []byte) (int, error) {
 
 func (s *Server) tmpDir() string { return filepath.Join(s.cfg.CacheDir, "tmp") }
 
-func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
+func (s *Server) handleLive(w http.ResponseWriter, r *http.Request) {
 	id := r.PathValue("id")
 	if !videoIDRe.MatchString(id) {
 		jsonErr(w, 400, "invalid video id")
@@ -197,46 +197,4 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			os.Remove(tmp.Name())
 		}
 	}
-}
-
-// handleDownload returns a complete Opus file (with Content-Length and Range
-// support) for offline storage on the client.
-func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
-	id := r.PathValue("id")
-	if !videoIDRe.MatchString(id) {
-		jsonErr(w, 400, "invalid video id")
-		return
-	}
-	w.Header().Set("Content-Type", "audio/ogg")
-	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s.opus"`, id))
-	if p, ok := s.cachedPath(id); ok {
-		s.touchTrack(id)
-		http.ServeFile(w, r, p)
-		return
-	}
-	p, err := s.startPipeline(r.Context(), id)
-	if err != nil {
-		slog.Error("download pipeline failed", "id", id, "err", err)
-		jsonErr(w, 502, "could not fetch audio")
-		return
-	}
-	defer p.cancel()
-	tmp, err := os.CreateTemp(s.tmpDir(), id+"-*.part")
-	if err != nil {
-		jsonErr(w, 500, "temp file error")
-		return
-	}
-	_, cerr := io.Copy(tmp, p.out)
-	werr := p.wait()
-	if cerr != nil || werr != nil {
-		tmp.Close()
-		os.Remove(tmp.Name())
-		slog.Error("download transcode failed", "id", id, "copy", cerr, "wait", werr)
-		jsonErr(w, 502, "transcode failed")
-		return
-	}
-	tmp.Seek(0, io.SeekStart)
-	http.ServeContent(w, r, id+".opus", time.Now(), tmp)
-	tmp.Close()
-	s.recordFullStream(id, tmp.Name())
 }

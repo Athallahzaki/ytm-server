@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -18,6 +19,14 @@ type Server struct {
 	db  *sql.DB
 	ytm *YTM
 	sem chan struct{} // limits concurrent transcodes
+
+	jobs   map[string]*job
+	jobsMu sync.Mutex
+
+	pairs      map[string]*pairing
+	pairMu     sync.Mutex
+	pairFails  int
+	pairFailAt time.Time
 }
 
 type statusWriter struct {
@@ -47,7 +56,7 @@ func main() {
 	cfg := LoadConfig()
 	slog.SetDefault(setupLogging(cfg))
 
-	for _, d := range []string{cfg.DataDir, filepath.Join(cfg.CacheDir, "audio"), filepath.Join(cfg.CacheDir, "tmp")} {
+	for _, d := range []string{cfg.DataDir, filepath.Join(cfg.CacheDir, "audio"), filepath.Join(cfg.CacheDir, "tmp"), filepath.Join(cfg.CacheDir, "warm")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
 			slog.Error("cannot create dir", "dir", d, "err", err)
 			os.Exit(1)
@@ -72,7 +81,8 @@ func main() {
 	}
 	defer db.Close()
 
-	s := &Server{cfg: cfg, db: db, ytm: NewYTM(), sem: make(chan struct{}, envInt("MAX_TRANSCODES", 4))}
+	s := &Server{cfg: cfg, db: db, ytm: NewYTM(), sem: make(chan struct{}, envInt("MAX_TRANSCODES", 4)),
+		jobs: map[string]*job{}, pairs: map[string]*pairing{}}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -90,6 +100,16 @@ func main() {
 
 	mux.HandleFunc("GET /api/v1/stream/{id}", s.auth(s.handleStream))
 	mux.HandleFunc("GET /api/v1/download/{id}", s.auth(s.handleDownload))
+	mux.HandleFunc("POST /api/v1/prepare/{id}", s.auth(s.handlePrepare))
+	mux.HandleFunc("POST /api/v1/played/{id}", s.auth(s.handlePlayed))
+	mux.HandleFunc("GET /api/v1/queue", s.auth(s.ytmHandler(s.handleQueue)))
+	mux.HandleFunc("PUT /api/v1/playlists/{id}/order", s.auth(s.setOrder))
+	mux.HandleFunc("POST /api/v1/ytplaylists", s.auth(s.handleCreateYT))
+
+	mux.HandleFunc("GET /pair", s.handlePairPage)
+	mux.HandleFunc("POST /pair/submit", s.handlePairSubmit)
+	mux.HandleFunc("POST /api/v1/pair/start", s.handlePairStart)
+	mux.HandleFunc("GET /api/v1/pair/status", s.handlePairStatus)
 
 	mux.HandleFunc("GET /api/v1/playlists", s.auth(s.listPlaylists))
 	mux.HandleFunc("POST /api/v1/playlists", s.auth(s.createPlaylist))

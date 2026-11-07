@@ -30,39 +30,58 @@ func (s *Server) touchTrack(id string) {
 	s.db.Exec(`UPDATE tracks SET play_count=play_count+1, last_access=? WHERE video_id=?`, time.Now().Unix(), id)
 }
 
-// recordFullStream is called after a track has been fully delivered. It bumps
-// the full-stream counter and promotes the temp file into the permanent cache
-// once the threshold is reached. The temp file is always consumed.
-func (s *Server) recordFullStream(id, tmp string) {
+func (s *Server) countPlay(id string) (int, error) {
 	var n int
 	err := s.db.QueryRow(`INSERT INTO stream_counts(video_id, full_streams) VALUES(?,1)
 		ON CONFLICT(video_id) DO UPDATE SET full_streams=full_streams+1 RETURNING full_streams`, id).Scan(&n)
+	return n, err
+}
+
+// commitToCache moves a finished Opus file into the permanent cache and indexes it.
+func (s *Server) commitToCache(id, src string, n int) {
+	dst := s.audioPath(id)
+	if err := os.Rename(src, dst); err != nil {
+		slog.Error("cache commit failed", "id", id, "err", err)
+		return
+	}
+	st, err := os.Stat(dst)
+	if err != nil {
+		return
+	}
+	now := time.Now().Unix()
+	if _, err := s.db.Exec(`INSERT OR REPLACE INTO tracks(video_id,path,size,play_count,last_access,cached_at) VALUES(?,?,?,?,?,?)`,
+		id, dst, st.Size(), n, now, now); err != nil {
+		slog.Error("cache index failed", "id", id, "err", err)
+		os.Remove(dst)
+		return
+	}
+	slog.Info("track cached", "id", id, "bytes", st.Size(), "plays", n)
+}
+
+// recordFullStream is used by the live pipe path once a stream finished completely.
+func (s *Server) recordFullStream(id, tmp string) {
+	n, err := s.countPlay(id)
 	if err != nil {
 		slog.Error("stream count failed", "id", id, "err", err)
 		os.Remove(tmp)
 		return
 	}
 	if _, cached := s.cachedPath(id); cached || n < s.cfg.Threshold {
-		slog.Debug("not caching", "id", id, "full_streams", n, "threshold", s.cfg.Threshold)
 		os.Remove(tmp)
 		return
 	}
-	dst := s.audioPath(id)
-	if err := os.Rename(tmp, dst); err != nil {
-		slog.Error("cache commit failed", "id", id, "err", err)
-		os.Remove(tmp)
-		return
+	s.commitToCache(id, tmp, n)
+}
+
+// cleanWarm drops prefetched files nobody has touched for an hour.
+func (s *Server) cleanWarm() {
+	dir := filepath.Join(s.cfg.CacheDir, "warm")
+	entries, _ := os.ReadDir(dir)
+	for _, e := range entries {
+		if info, err := e.Info(); err == nil && time.Since(info.ModTime()) > time.Hour {
+			os.Remove(filepath.Join(dir, e.Name()))
+		}
 	}
-	st, _ := os.Stat(dst)
-	now := time.Now().Unix()
-	_, err = s.db.Exec(`INSERT OR REPLACE INTO tracks(video_id,path,size,play_count,last_access,cached_at) VALUES(?,?,?,?,?,?)`,
-		id, dst, st.Size(), n, now, now)
-	if err != nil {
-		slog.Error("cache index failed", "id", id, "err", err)
-		os.Remove(dst)
-		return
-	}
-	slog.Info("track cached", "id", id, "bytes", st.Size(), "full_streams", n)
 }
 
 func (s *Server) evictLoop(ctx context.Context) {
@@ -82,6 +101,7 @@ func (s *Server) evictLoop(ctx context.Context) {
 // its limits. Score = play_count / (1 + days since last access): frequently
 // played (LFU) and recently played (LRU) tracks both score high.
 func (s *Server) evictOnce() {
+	s.cleanWarm()
 	rows, err := s.db.Query(`SELECT video_id, path, size, play_count, last_access FROM tracks`)
 	if err != nil {
 		slog.Error("evict query failed", "err", err)

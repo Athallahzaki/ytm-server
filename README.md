@@ -55,3 +55,13 @@ MAX_TRANSCODES=4, YTDLP_PATH, FFMPEG_PATH, YTDLP_EXTRA_ARGS.
 - Logs: console (text) + `/cache/logs/server.log` (JSON, 10 MB x 5 rotation).
 - The YouTube Music client is unofficial (cookie auth, like ytmusicapi). Response parsing is
   generic and may need tweaks if YouTube changes its JSON. Keep yt-dlp updated.
+
+## v2 additions
+- `mode=music|youtube` query param on home/search/library/ytplaylist/queue (same cookie, same backend; two client identities).
+- `GET /api/v1/queue?videoId=|playlistId=` auto-mix / mix / playlist queue. Mix ids (`RD...`) open through it.
+- `/stream/{id}` now serves a finished, seekable file (Content-Length + Range, real duration). `?live=1` keeps the old instant-start pipe.
+- `POST /api/v1/prepare/{id}` prefetch; `POST /api/v1/played/{id}` counts a listen (drives the cache threshold).
+- Items include `duration` (seconds) where YouTube provides it.
+- `POST /api/v1/playlists` accepts `tracks`; `PUT /api/v1/playlists/{id}/order`; `POST /api/v1/ytplaylists` creates a real (private by default) YouTube playlist.
+- Pairing: phone calls `POST /api/v1/pair/start`, computer opens `/pair` and submits cookie + code, phone polls `/api/v1/pair/status`.
+- Warm (prefetched) files live in `/cache/warm` and are removed after an hour unless promoted to the cache.
